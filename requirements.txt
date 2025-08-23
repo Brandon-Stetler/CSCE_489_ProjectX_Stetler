@@ -1,6 +1,3 @@
-# CSCE_489_ProjectX_Stetler
-CSCE 489 Summer 2025 Project X - Capt Brandon Stetler
-
 # On-Device Continual Learning (CPU-only demo)
 
 Goal: show whether a resource-constrained robot can refine a small vision model **on board** (no cloud) within tight CPU/RAM/time budgets.

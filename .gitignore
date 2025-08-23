@@ -1,0 +1,17 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+# outputs
+plots/
+runs/
+results.csv
+*.log
+*.pt
+*.tmp
+# data
+data_real/
+data_synth/
+# OS/editor
+.DS_Store
+Thumbs.db

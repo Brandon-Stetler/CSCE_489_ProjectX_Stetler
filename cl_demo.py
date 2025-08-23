@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 cl_demo.py — On-device continual learning demo (CPU-only)
 
@@ -185,7 +186,7 @@ def main():
     model.to(DEVICE)                                          # move to CPU device
 
     # 4) Set up optimizer and loss (only the new head’s parameters will update).
-    opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)  # Adam = fast convergence
+    opt = torch.optim.Adam(model.classifier.parameters(), lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
     loss_fn = nn.CrossEntropyLoss()                           # standard multi-class loss
 
     # 5) Quick "lab calibration" pass on synthetic data (optional warm-start).

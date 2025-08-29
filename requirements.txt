@@ -1,14 +1,14 @@
-# On-Device Continual Learning (CPU-only demo)
+# Core
+torch==2.2.0
+torchvision==0.17.0
 
-Goal: show whether a resource-constrained robot can refine a small vision model **on board** (no cloud) within tight CPU/RAM/time budgets.
+# Imaging & transforms
+Pillow>=9.4,<11
 
-**Success bars**
-- Accuracy: ≥80% on 20 real photos **and** +15 pp over pre-tune
-- Effort: total fine-tune <60 s, peak RAM <400 MB, no paging
+# Plotting & CSV analysis
+matplotlib>=3.5,<3.8
+pandas>=1.5,<2.1
+numpy>=1.24,<1.27
 
-## Setup
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip -r requirements.txt
-sudo apt install -y linux-tools-common linux-tools-generic  # for 'perf' (optional)
+# Optional (used for peak-RSS if available; your script falls back to stdlib)
+psutil>=5.9

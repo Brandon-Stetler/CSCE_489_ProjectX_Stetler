@@ -182,11 +182,18 @@ def main():
     model = models.mobilenet_v2(weights="IMAGENET1K_V2")      # download/use pretrained weights
     for p in model.features.parameters():                     # freeze all earlier layers
         p.requires_grad = False                               # only train the classifier head
+    # ...except the last feature block (give the model a little capacity to adapt)
+    for p in model.features[-1].parameters():
+        p.requires_grad = True
+
     model.classifier[1] = nn.Linear(1280, len(classes))       # swap 1000-class head -> 4 classes
     model.to(DEVICE)                                          # move to CPU device
 
     # 4) Set up optimizer and loss (only the new head’s parameters will update).
-    opt = torch.optim.Adam(model.classifier.parameters(), lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
+    # BEFORE
+    # opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(list(model.classifier.parameters()) + list(model.features[-1].parameters()),
+    lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
     loss_fn = nn.CrossEntropyLoss()                           # standard multi-class loss
 
     # 5) Quick "lab calibration" pass on synthetic data (optional warm-start).

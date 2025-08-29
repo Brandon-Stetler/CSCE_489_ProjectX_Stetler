@@ -63,42 +63,41 @@ label_map = {c: i for i, c in enumerate(classes)}             # map class name -
 
 # ---------- Image preprocessing ----------
 # Normalize images the same way the pretrained model expects (ImageNet stats).
+IMG_SIZE = 160  # try 192 later if you want 4 epochs in 60s
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
-tf = transforms.Compose([
-    transforms.Resize((224, 224)),                            # resize to MobileNet’s input size
-    transforms.ToTensor(),                                    # convert PIL image -> PyTorch tensor
-    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)# standardize pixel ranges
+
+tf_train = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ColorJitter(brightness=0.25, contrast=0.15),   # no saturation
+    transforms.RandomRotation(8, fill=(210, 210, 210)),       # close to paper, not black
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+tf_eval = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])
 
 # ---------- Simple dataset that reads a flat folder of images ----------
 class LabeledFolder(Dataset):
-    """Reads images from a folder and infers the label from the filename prefix.
-
-    Example filename -> label:
-        orange_square_7.jpg  ->  class "orange_square"
-    """
-    def __init__(self, path: Path):
-        self.paths = []                                       # list of image file paths
-        self.labels = []                                      # parallel list of integer labels
-        for p in sorted(path.iterdir()):                      # iterate files in the folder
-            if p.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
-                continue                                      # skip non-image files
-            key = "_".join(p.stem.split("_")[:2])             # take first two parts: color_shape
-            if key not in label_map:
-                continue                                      # skip files that don’t match our 4 classes
-            self.paths.append(p)                              # keep the image path
-            self.labels.append(label_map[key])                # store its numeric label
-
-    def __len__(self):
-        return len(self.paths)                                # dataset length for PyTorch
-
+    def __init__(self, path: Path, transform):
+        self.transform = transform
+        self.paths, self.labels = [], []
+        for p in sorted(path.iterdir()):
+            if p.suffix.lower() not in [".jpg",".jpeg",".png"]:
+                continue
+            key = "_".join(p.stem.split("_")[:2])
+            if key in label_map:
+                self.paths.append(p)
+                self.labels.append(label_map[key])
+    def __len__(self): return len(self.paths)
     def __getitem__(self, i):
-        # Open image and fix orientation using EXIF (phones often rotate images).
         img = ImageOps.exif_transpose(Image.open(self.paths[i])).convert("RGB")
-        # Apply transforms and return (image_tensor, label_tensor).
-        return tf(img), torch.tensor(self.labels[i])
-
+        return self.transform(img), torch.tensor(self.labels[i])
 # ---------- Generate synthetic "lab" images (clean colored shapes) ----------
 def gen_synth(n: int = 100):
     """Create n synthetic images split evenly across the 4 classes."""
@@ -119,9 +118,16 @@ def gen_synth(n: int = 100):
             img.save(SYN / f"{cls}_{k}.png")                  # write to data_synth/
 
 # ---------- Utility: current process memory in MB ----------
+#def peak_rss_mb():
+#    """Return resident set size (RAM in use) for this process, in MB."""
+#   return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+import resource
 def peak_rss_mb():
-    """Return resident set size (RAM in use) for this process, in MB."""
-    return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+    try:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / (1024*1024) if sys.platform == "darwin" else peak / 1024.0
+    except Exception:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
 
 # ---------- Utility: accuracy on a DataLoader ----------
 def accuracy(model, loader):
@@ -171,12 +177,17 @@ def main():
         gen_synth(args.synth)                                 # generate synthetic shapes
 
     # 2) Build datasets and loaders (synthetic once, real for adaptation).
-    ds_syn  = LabeledFolder(SYN)                              # dataset from data_synth/
-    ds_real = LabeledFolder(REAL)                             # dataset from data_real/
-    dl_syn  = DataLoader(ds_syn,  batch_size=args.batch,      # DataLoader for synthetic
-                         shuffle=True, num_workers=args.workers)
-    dl_real = DataLoader(ds_real, batch_size=args.batch,      # DataLoader for real photos
-                         shuffle=True, num_workers=args.workers)
+    ds_syn        = LabeledFolder(SYN, tf_eval)
+    ds_real_train = LabeledFolder(REAL, tf_train)
+    ds_real_eval  = LabeledFolder(REAL, tf_eval)
+
+    dl_syn  = DataLoader(ds_syn,  batch_size=args.batch, shuffle=True,  num_workers=args.workers)
+    dl_real = DataLoader(ds_real_train, batch_size=args.batch, shuffle=True,  num_workers=args.workers)
+    dl_eval = DataLoader(ds_real_eval, batch_size=args.batch, shuffle=False, num_workers=0)
+
+    from collections import Counter
+    print("real class counts:", Counter([label_map["_".join(p.stem.split("_")[:2])] 
+                                        for p in REAL.iterdir() if p.suffix.lower() in [".jpg",".jpeg",".png"]]))
 
     # 3) Load MobileNet-V2 pretrained on ImageNet and replace the last layer.
     model = models.mobilenet_v2(weights="IMAGENET1K_V2")      # download/use pretrained weights
@@ -206,7 +217,7 @@ def main():
         opt.step()                                            # update the head’s weights
 
     # 6) Measure accuracy on real photos *before* fine-tuning (baseline).
-    pre_acc = accuracy(model, dl_real)
+    pre_acc = accuracy(model, dl_eval)
 
     # 7) Fine-tune on the 20 real photos for a few epochs with logging.
     rows = [["epoch", "train_acc", "val_acc", "sec", "peak_MB", "ext4_ms", "tmpfs_ms"]] # CSV header
@@ -222,7 +233,7 @@ def main():
         sec = time.time() - t0                                # seconds for this epoch
 
         peakMB = peak_rss_mb()                                # measure RAM usage now
-        tr_acc = accuracy(model, dl_real)                     # accuracy on (tiny) training set
+        tr_acc = accuracy(model, dl_eval)                     # accuracy on (tiny) training set
         va_acc = tr_acc                                       # no separate val set → reuse as proxy
 
         ext4_ms, tmpfs_ms = timed_checkpoint(model,           # time disk vs RAM checkpoint

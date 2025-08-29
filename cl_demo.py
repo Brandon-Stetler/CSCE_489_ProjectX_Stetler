@@ -34,6 +34,8 @@ from torch.utils.data import Dataset, DataLoader  # data plumbing
 from torchvision import models, transforms        # pretrained models + image transforms
 from PIL import Image, ImageDraw, ImageOps        # image I/O, drawing, EXIF-aware rotation
 
+DO_WARMSTART = False  # add near top
+
 # ---------- CLI arguments ----------
 ap = argparse.ArgumentParser()                                # create parser
 ap.add_argument("--workers", type=int, default=0,             # DataLoader worker threads
@@ -63,7 +65,7 @@ label_map = {c: i for i, c in enumerate(classes)}             # map class name -
 
 # ---------- Image preprocessing ----------
 # Normalize images the same way the pretrained model expects (ImageNet stats).
-IMG_SIZE = 160  # try 192 later if you want 4 epochs in 60s
+IMG_SIZE = 144  
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -121,6 +123,7 @@ def gen_synth(n: int = 100):
 #def peak_rss_mb():
 #    """Return resident set size (RAM in use) for this process, in MB."""
 #   return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+import sys
 import resource
 def peak_rss_mb():
     try:
@@ -194,8 +197,8 @@ def main():
     for p in model.features.parameters():                     # freeze all earlier layers
         p.requires_grad = False                               # only train the classifier head
     # ...except the last feature block (give the model a little capacity to adapt)
-    for p in model.features[-1].parameters():
-        p.requires_grad = True
+    #for p in model.features[-1].parameters():
+    #    p.requires_grad = True
 
     model.classifier[1] = nn.Linear(1280, len(classes))       # swap 1000-class head -> 4 classes
     model.to(DEVICE)                                          # move to CPU device
@@ -203,18 +206,20 @@ def main():
     # 4) Set up optimizer and loss (only the new head’s parameters will update).
     # BEFORE
     # opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)
-    opt = torch.optim.Adam(list(model.classifier.parameters()) + list(model.features[-1].parameters()),
-    lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
+    opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
+    #opt = torch.optim.Adam(list(model.classifier.parameters()) + list(model.features[-1].parameters()),
+    #lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
     loss_fn = nn.CrossEntropyLoss()                           # standard multi-class loss
 
     # 5) Quick "lab calibration" pass on synthetic data (optional warm-start).
-    model.train()                                             # training mode
-    for x, y in dl_syn:                                       # iterate synthetic batches once
-        opt.zero_grad()                                       # clear previous gradients
-        logits = model(x.to(DEVICE))                          # forward pass
-        loss = loss_fn(logits, y.to(DEVICE))                  # compute loss
-        loss.backward()                                       # backprop to compute gradients
-        opt.step()                                            # update the head’s weights
+    if DO_WARMSTART:
+        model.train()                                             # training mode
+        for x, y in dl_syn:                                       # iterate synthetic batches once
+            opt.zero_grad()                                       # clear previous gradients
+            logits = model(x.to(DEVICE))                          # forward pass
+            loss = loss_fn(logits, y.to(DEVICE))                  # compute loss
+            loss.backward()                                       # backprop to compute gradients
+            opt.step()                                            # update the head’s weights
 
     # 6) Measure accuracy on real photos *before* fine-tuning (baseline).
     pre_acc = accuracy(model, dl_eval)

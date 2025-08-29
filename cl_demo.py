@@ -27,11 +27,15 @@ import argparse             # command-line options like --workers
 import math                 # safe division / NaN handling
 from pathlib import Path    # filesystem paths that work on any OS
 
-import psutil               # read current process memory (peak RSS)
-import torch
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import psutil               # read current process memory (peak RSS)
+import torch
+import sys
+import resource
+
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 torch.backends.mkldnn.enabled = False
@@ -41,6 +45,18 @@ from torchvision import models, transforms        # pretrained models + image tr
 from PIL import Image, ImageDraw, ImageOps        # image I/O, drawing, EXIF-aware rotation
 
 DO_WARMSTART = False  # add near top
+BASE_MAXRSS = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+def rss_now_mb():
+    # point-in-time resident set (what most people mean by “RAM in use now”)
+    return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+
+def peak_delta_mb():
+    # extra peak above the baseline (approx “peak during training”)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss units: KB on Linux, bytes on macOS
+    def to_mb(v): return (v/(1024*1024)) if sys.platform == "darwin" else (v/1024.0)
+    return max(0.0, to_mb(peak) - to_mb(BASE_MAXRSS))
 
 # ---------- CLI arguments ----------
 ap = argparse.ArgumentParser()                                # create parser
@@ -71,7 +87,7 @@ label_map = {c: i for i, c in enumerate(classes)}             # map class name -
 
 # ---------- Image preprocessing ----------
 # Normalize images the same way the pretrained model expects (ImageNet stats).
-IMG_SIZE = 144  
+IMG_SIZE = 128
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -129,14 +145,13 @@ def gen_synth(n: int = 100):
 #def peak_rss_mb():
 #    """Return resident set size (RAM in use) for this process, in MB."""
 #   return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
-import sys
-import resource
-def peak_rss_mb():
-    try:
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return peak / (1024*1024) if sys.platform == "darwin" else peak / 1024.0
-    except Exception:
-        return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+
+#def peak_rss_mb():
+#    try:
+#        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+#        return peak / (1024*1024) if sys.platform == "darwin" else peak / 1024.0
+#    except Exception:
+#        return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
 
 # ---------- Utility: accuracy on a DataLoader ----------
 def accuracy(model, loader):
@@ -243,7 +258,7 @@ def main():
             opt.step()                                        # update classifier weights
         sec = time.time() - t0                                # seconds for this epoch
 
-        peakMB = peak_rss_mb()                                # measure RAM usage now
+        peakMB = peak_delta_mb()                              # measure RAM usage now
         tr_acc = accuracy(model, dl_eval)                     # accuracy on (tiny) training set
         va_acc = tr_acc                                       # no separate val set → reuse as proxy
 

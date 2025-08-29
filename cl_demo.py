@@ -28,7 +28,13 @@ import math                 # safe division / NaN handling
 from pathlib import Path    # filesystem paths that work on any OS
 
 import psutil               # read current process memory (peak RSS)
-import torch                # core PyTorch tensor & training library
+import torch
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+torch.backends.mkldnn.enabled = False
 from torch import nn        # neural-network layers/losses
 from torch.utils.data import Dataset, DataLoader  # data plumbing
 from torchvision import models, transforms        # pretrained models + image transforms

@@ -3,100 +3,90 @@
 """
 cl_demo.py — On-device continual learning demo (CPU-only)
 
-This script shows whether a small robot could update ("fine-tune") its vision
-model on its own hardware without sending images to the cloud.
+This script checks whether a tiny robot could fine-tune a vision model locally
+(privacy-friendly) under tight time/memory budgets.
 
 Flow:
   1) Generate a clean synthetic dataset of colored shapes (lab-like data).
-  2) Load your 20 real photos of the same shapes (field-like data).
-  3) Load a small pretrained image model (MobileNet-V2), replace the last layer,
-     and fine-tune only that layer on the 20 real photos.
-  4) Measure wall-clock time per epoch, peak RAM, and checkpoint write times.
-  5) Save results to a CSV and simple plots.
+  2) Load ~20 real photos of the same shapes (field-like data).
+  3) Load a tiny pretrained model (MobileNetV2), replace the last classifier
+     layer, and fine-tune only that head on the real photos (CPU only).
+  4) Measure per-epoch wall time, RAM (both current RSS and absolute PEAK),
+     and checkpoint write times (ext4 vs tmpfs).
+  5) Save a CSV and simple plots.
 
-Success bar (checked at the end):
-  - Total fine-tune < 60 s
-  - Peak RAM < 400 MB
+Success bar checked at the end:
+  - Total fine-tune time < 60 s
+  - Peak RAM (absolute RSS) < 400 MB
 """
 
-# ---------- Imports ----------
-import os                   # OS utilities (paths, process info)
-import time                 # timing (wall-clock seconds)
-import csv                  # write results.csv
-import argparse             # command-line options like --workers
-import math                 # safe division / NaN handling
-from pathlib import Path    # filesystem paths that work on any OS
+# ---------- Imports & CPU pinning (do this before importing torch) ----------
+import os                               # OS utilities (env vars, paths, PIDs)
+os.environ.setdefault("OMP_NUM_THREADS", "1")        # keep BLAS single-thread
+os.environ.setdefault("MKL_NUM_THREADS", "1")        # "
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # "
 
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+import time                             # precise timing
+import csv                              # write results.csv
+import argparse                         # CLI flags like --workers/--batch
+import math                             # safe division / NaN guards
+from pathlib import Path                # cross-platform file paths
+import sys                              # to detect platform for ru_maxrss units
+import resource                         # ru_maxrss (absolute peak RSS)
+import psutil                           # current RSS (point-in-time)
 
-import psutil               # read current process memory (peak RSS)
-import torch
-import sys
-import resource
+import torch                            # core tensor/training lib (CPU)
+torch.set_num_threads(1)                # PyTorch intra-op threads = 1
+torch.set_num_interop_threads(1)        # PyTorch inter-op threads = 1
+torch.backends.mkldnn.enabled = False   # avoid MKL-DNN path on CPU (stability)
+from torch import nn                    # layers/losses
+from torch.utils.data import Dataset, DataLoader  # minimal data plumbing
 
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-torch.backends.mkldnn.enabled = False
-from torch import nn        # neural-network layers/losses
-from torch.utils.data import Dataset, DataLoader  # data plumbing
-from torchvision import models, transforms        # pretrained models + image transforms
-from PIL import Image, ImageDraw, ImageOps        # image I/O, drawing, EXIF-aware rotation
+from torchvision import models, transforms         # MobileNet + transforms
+from PIL import Image, ImageDraw, ImageOps        # image I/O, drawing, EXIF rotate
 
-DO_WARMSTART = False  # add near top
-BASE_MAXRSS = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
-def rss_now_mb():
-    # point-in-time resident set (what most people mean by “RAM in use now”)
-    return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
-
-def peak_delta_mb():
-    # extra peak above the baseline (approx “peak during training”)
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # ru_maxrss units: KB on Linux, bytes on macOS
-    def to_mb(v): return (v/(1024*1024)) if sys.platform == "darwin" else (v/1024.0)
-    return max(0.0, to_mb(peak) - to_mb(BASE_MAXRSS))
+# Optional warm-start on synth data (kept False for speed/memory)
+DO_WARMSTART = False
 
 # ---------- CLI arguments ----------
-ap = argparse.ArgumentParser()                                # create parser
-ap.add_argument("--workers", type=int, default=0,             # DataLoader worker threads
+ap = argparse.ArgumentParser()
+ap.add_argument("--workers", type=int, default=0,
                 help="DataLoader workers: 0 (simplest) or 4 (parallel I/O)")
-ap.add_argument("--epochs_real", type=int, default=3,         # how many passes over real photos
-                help="Number of epochs on the 20 real photos")
-ap.add_argument("--batch", type=int, default=16,              # minibatch size
-                help="Batch size for training and evaluation")
-ap.add_argument("--synth", type=int, default=100,             # how many synthetic images to make
+ap.add_argument("--epochs_real", type=int, default=4,
+                help="Number of epochs on the real photos")
+ap.add_argument("--batch", type=int, default=4,
+                help="Mini-batch size for training/eval (CPU-friendly small)")
+ap.add_argument("--synth", type=int, default=100,
                 help="Number of synthetic images to generate")
-args = ap.parse_args()                                        # parse argv into 'args'
+args = ap.parse_args()
 
 # ---------- Paths & device ----------
-DEVICE = torch.device("cpu")                                  # force CPU (fits a low-end robot)
-PROJECT = Path(".")                                           # project root (current folder)
-SYN = PROJECT / "data_synth"                                  # synthetic images go here
-REAL = PROJECT / "data_real"                                  # your 20 photos go here
-PLOTS = PROJECT / "plots"                                     # output charts go here
-SYN.mkdir(exist_ok=True)                                      # make folders if missing
+DEVICE  = torch.device("cpu")           # force CPU (fits low-end hardware)
+PROJECT = Path(".")                     # project root (current folder)
+SYN     = PROJECT / "data_synth"        # synthetic images live here
+REAL    = PROJECT / "data_real"         # put your ~20 photos here
+PLOTS   = PROJECT / "plots"             # output charts go here
+SYN.mkdir(exist_ok=True)                # create folders if missing
 PLOTS.mkdir(exist_ok=True)
 assert REAL.exists(), "Put ~20 real photos in ./data_real named orange_square_*.jpg etc."
 
 # ---------- Class labels ----------
-# Four classes: two colors (orange/blue) × two shapes (square/circle).
-classes = ["orange_square", "blue_square", "orange_circle", "blue_circle"]
-label_map = {c: i for i, c in enumerate(classes)}             # map class name -> integer id
+# Four classes = {orange, blue} × {square, circle}
+classes   = ["orange_square", "blue_square", "orange_circle", "blue_circle"]
+label_map = {c: i for i, c in enumerate(classes)}  # "orange_square" -> 0, etc.
 
 # ---------- Image preprocessing ----------
-# Normalize images the same way the pretrained model expects (ImageNet stats).
-IMG_SIZE = 128
+# Resize small (faster/cheaper), then normalize like ImageNet.
+IMG_SIZE = 128                           # good balance: fast + accurate on CPU
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 tf_train = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ColorJitter(brightness=0.25, contrast=0.15),   # no saturation
-    transforms.RandomRotation(8, fill=(210, 210, 210)),       # close to paper, not black
-    transforms.ToTensor(),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),               # shrink early
+    transforms.ColorJitter(brightness=0.25, contrast=0.15),# tiny photometric wiggle
+    transforms.RandomRotation(8, fill=(210, 210, 210)),    # paper-like border
+    transforms.ToTensor(),                                 # [0,1] -> tensor
     transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])
 
@@ -106,186 +96,207 @@ tf_eval = transforms.Compose([
     transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])
 
-# ---------- Simple dataset that reads a flat folder of images ----------
+# ---------- Dataset that reads a flat folder of images ----------
 class LabeledFolder(Dataset):
+    """
+    Expects filenames like: orange_square_001.jpg
+    Label is parsed from the first two underscore-separated tokens.
+    """
     def __init__(self, path: Path, transform):
         self.transform = transform
         self.paths, self.labels = [], []
         for p in sorted(path.iterdir()):
-            if p.suffix.lower() not in [".jpg",".jpeg",".png"]:
+            if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
                 continue
-            key = "_".join(p.stem.split("_")[:2])
+            key = "_".join(p.stem.split("_")[:2])          # e.g., "orange_square"
             if key in label_map:
                 self.paths.append(p)
                 self.labels.append(label_map[key])
-    def __len__(self): return len(self.paths)
+
+    def __len__(self):
+        return len(self.paths)
+
     def __getitem__(self, i):
+        # EXIF-aware rotate, force RGB, apply transform, return (img, label)
         img = ImageOps.exif_transpose(Image.open(self.paths[i])).convert("RGB")
         return self.transform(img), torch.tensor(self.labels[i])
-# ---------- Generate synthetic "lab" images (clean colored shapes) ----------
+
+# ---------- Synthetic "lab" images (clean colored shapes) ----------
 def gen_synth(n: int = 100):
     """Create n synthetic images split evenly across the 4 classes."""
-    per = max(1, n // len(classes))                           # images per class (roughly equal)
-    for cls in classes:                                       # loop over each class name
-        color, shape = cls.split("_")                         # separate 'orange' and 'square'
-        for k in range(per):                                  # produce 'per' images for this class
-            img = Image.new("RGB", (224, 224), "black")       # start with black background
-            d = ImageDraw.Draw(img)                           # drawing context
-            if color == "orange":
-                c = (240, 140, 0)                             # RGB for orange (roughly)
-            else:  # blue
-                c = (0, 110, 255)                             # RGB for blue
+    per = max(1, n // len(classes))                         # roughly equal per class
+    for cls in classes:
+        color, shape = cls.split("_")                       # e.g., ("orange", "square")
+        for k in range(per):
+            img = Image.new("RGB", (224, 224), "black")     # black background
+            d = ImageDraw.Draw(img)
+            c = (240, 140, 0) if color == "orange" else (0, 110, 255)
             if shape == "square":
-                d.rectangle([60, 60, 164, 164], fill=c)       # draw a filled square
+                d.rectangle([60, 60, 164, 164], fill=c)     # filled square
             else:
-                d.ellipse([60, 60, 164, 164], fill=c)         # draw a filled circle
-            img.save(SYN / f"{cls}_{k}.png")                  # write to data_synth/
+                d.ellipse([60, 60, 164, 164], fill=c)       # filled circle
+            img.save(SYN / f"{cls}_{k}.png")
 
-# ---------- Utility: current process memory in MB ----------
-#def peak_rss_mb():
-#    """Return resident set size (RAM in use) for this process, in MB."""
-#   return psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+# ---------- Memory helpers ----------
+def _ru_to_mb(v: int) -> float:
+    """Convert ru_maxrss units to MB (KB on Linux, bytes on macOS)."""
+    return (v / (1024 * 1024)) if sys.platform == "darwin" else (v / 1024.0)
 
-#def peak_rss_mb():
-#    try:
-#        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-#        return peak / (1024*1024) if sys.platform == "darwin" else peak / 1024.0
-#    except Exception:
-#        return psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+def rss_now_mb() -> float:
+    """Point-in-time Resident Set Size (what's in RAM *right now*)."""
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
-# ---------- Utility: accuracy on a DataLoader ----------
-def accuracy(model, loader):
-    """Compute simple classification accuracy over a loader."""
-    model.eval()                                              # eval mode = no dropout/batchnorm updates
-    correct = 0                                               # count of correct predictions
-    total = 0                                                 # total examples seen
-    with torch.no_grad():                                     # disable gradients for speed/memory
-        for x, y in loader:                                   # loop over batches
-            logits = model(x.to(DEVICE))                      # forward pass on CPU
-            pred = logits.argmax(1).cpu()                     # predicted class indices
-            correct += (pred == y).sum().item()               # add correct predictions
-            total += y.numel()                                # add batch size
-    return (correct / total) if total > 0 else math.nan       # guard against divide-by-zero
+def abs_peak_mb() -> float:
+    """Absolute process peak RSS so far (monotonic, since process start)."""
+    return _ru_to_mb(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
-# ---------- Utility: checkpoint to ext4 vs tmpfs and time each ----------
-def timed_checkpoint(model, path: Path):
-    """Save the model twice and time it:
-       1) ext4 (normal disk in your project folder)
-       2) tmpfs (/dev/shm — RAM disk)
-       Use atomic rename to avoid partial files.
+def delta_peak_mb(baseline_ru: int) -> float:
+    """
+    Extra peak above a saved baseline ru_maxrss. Useful to report
+    'how much higher did our peak go during training' for the paper.
+    """
+    return max(0.0, abs_peak_mb() - _ru_to_mb(baseline_ru))
+
+# ---------- Simple accuracy ----------
+@torch.no_grad()
+def accuracy(model: nn.Module, loader: DataLoader) -> float:
+    """Compute classification accuracy over a loader (no gradients)."""
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        logits = model(x.to(DEVICE))          # forward pass (CPU)
+        pred = logits.argmax(1).cpu()         # predicted class index
+        correct += (pred == y).sum().item()
+        total   += y.numel()
+    return (correct / total) if total > 0 else math.nan
+
+# ---------- Checkpoint timing: ext4 vs tmpfs ----------
+def timed_checkpoint(model: nn.Module, path: Path):
+    """
+    Save the model twice and time each:
+      1) ext4 (normal disk under the project folder)
+      2) tmpfs (/dev/shm — RAM disk)
+    Use atomic rename to avoid partial files.
     """
     # --- ext4 write ---
-    t0 = time.perf_counter()                                  # high-resolution start time
-    torch.save(model.state_dict(), path.with_suffix(".pt.tmp")) # write to temp file
-    os.replace(path.with_suffix(".pt.tmp"),                   # atomic rename = crash-safe
-               path.with_suffix(".pt"))
-    ext4_ms = (time.perf_counter() - t0) * 1000.0             # elapsed time in milliseconds
+    t0 = time.perf_counter()
+    torch.save(model.state_dict(), path.with_suffix(".pt.tmp"))
+    os.replace(path.with_suffix(".pt.tmp"), path.with_suffix(".pt"))
+    ext4_ms = (time.perf_counter() - t0) * 1000.0
 
     # --- tmpfs write (/dev/shm is memory-backed) ---
-    t1 = time.perf_counter()                                  # new timer
-    tmpfs_tmp = Path("/dev/shm/model_tmp.pt.tmp")             # temp file in RAM
-    tmpfs_dst = Path("/dev/shm/model_tmp.pt")                 # final file in RAM
-    torch.save(model.state_dict(), tmpfs_tmp)                 # write model state
-    os.replace(tmpfs_tmp, tmpfs_dst)                          # atomic rename in RAM
-    tmpfs_ms = (time.perf_counter() - t1) * 1000.0            # elapsed ms for tmpfs
+    t1 = time.perf_counter()
+    tmpfs_tmp = Path("/dev/shm/model_tmp.pt.tmp")
+    tmpfs_dst = Path("/dev/shm/model_tmp.pt")
+    torch.save(model.state_dict(), tmpfs_tmp)
+    os.replace(tmpfs_tmp, tmpfs_dst)
+    tmpfs_ms = (time.perf_counter() - t1) * 1000.0
+
+    # tidy RAM file (best effort)
     try:
-        tmpfs_dst.unlink()                                    # clean up RAM file
-    except:
+        tmpfs_dst.unlink()
+    except Exception:
         pass
-    return ext4_ms, tmpfs_ms                                  # return both timings
+
+    return ext4_ms, tmpfs_ms
 
 # ---------- Main experiment ----------
 def main():
-    # 1) Ensure synthetic data exists; if not, create it once.
-    if not any(SYN.iterdir()):                                # folder empty?
-        gen_synth(args.synth)                                 # generate synthetic shapes
+    # 1) If synthetic data is missing, create it once.
+    if not any(SYN.iterdir()):
+        gen_synth(args.synth)
 
-    # 2) Build datasets and loaders (synthetic once, real for adaptation).
-    ds_syn        = LabeledFolder(SYN, tf_eval)
-    ds_real_train = LabeledFolder(REAL, tf_train)
-    ds_real_eval  = LabeledFolder(REAL, tf_eval)
+    # 2) Build datasets/loaders.
+    ds_syn        = LabeledFolder(SYN,  tf_eval)   # synth: eval tf is fine for warm-start
+    ds_real_train = LabeledFolder(REAL, tf_train)  # real: train tf with light augments
+    ds_real_eval  = LabeledFolder(REAL, tf_eval)   # real: eval tf
 
-    dl_syn  = DataLoader(ds_syn,  batch_size=args.batch, shuffle=True,  num_workers=args.workers)
+    dl_syn  = DataLoader(ds_syn,        batch_size=args.batch, shuffle=True,  num_workers=args.workers)
     dl_real = DataLoader(ds_real_train, batch_size=args.batch, shuffle=True,  num_workers=args.workers)
-    dl_eval = DataLoader(ds_real_eval, batch_size=args.batch, shuffle=False, num_workers=0)
+    dl_eval = DataLoader(ds_real_eval,  batch_size=args.batch, shuffle=False, num_workers=0)
 
+    # (Optional) show class balance — handy sanity check in logs
     from collections import Counter
-    print("real class counts:", Counter([label_map["_".join(p.stem.split("_")[:2])] 
-                                        for p in REAL.iterdir() if p.suffix.lower() in [".jpg",".jpeg",".png"]]))
+    counts = Counter([label_map["_".join(p.stem.split("_")[:2])]
+                      for p in REAL.iterdir() if p.suffix.lower() in {".jpg",".jpeg",".png"}])
+    print("real class counts:", {classes[k]: v for k, v in counts.items()})
 
-    # 3) Load MobileNet-V2 pretrained on ImageNet and replace the last layer.
-    model = models.mobilenet_v2(weights="IMAGENET1K_V2")      # download/use pretrained weights
-    for p in model.features.parameters():                     # freeze all earlier layers
-        p.requires_grad = False                               # only train the classifier head
-    # ...except the last feature block (give the model a little capacity to adapt)
-    #for p in model.features[-1].parameters():
-    #    p.requires_grad = True
+    # 3) Load MobileNetV2 pretrained on ImageNet; swap classifier.
+    model = models.mobilenet_v2(weights="IMAGENET1K_V2")
+    for p in model.features.parameters():
+        p.requires_grad = False                     # freeze all feature extractor
+    model.classifier[1] = nn.Linear(1280, len(classes))  # 1000 -> 4 classes
+    model.to(DEVICE)
 
-    model.classifier[1] = nn.Linear(1280, len(classes))       # swap 1000-class head -> 4 classes
-    model.to(DEVICE)                                          # move to CPU device
+    # 4) Optimizer + loss (head-only training is faster + tiny RAM).
+    opt     = torch.optim.Adam(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = nn.CrossEntropyLoss()
 
-    # 4) Set up optimizer and loss (only the new head’s parameters will update).
-    # BEFORE
-    # opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)
-    opt = torch.optim.Adam(model.classifier.parameters(), lr=1e-3, weight_decay=1e-4)
-    #opt = torch.optim.Adam(list(model.classifier.parameters()) + list(model.features[-1].parameters()),
-    #lr=5e-4, weight_decay=1e-4)  # Adam = fast convergence
-    loss_fn = nn.CrossEntropyLoss()                           # standard multi-class loss
-
-    # 5) Quick "lab calibration" pass on synthetic data (optional warm-start).
+    # 5) Optional "lab warm-start" — off by default (kept for completeness).
     if DO_WARMSTART:
-        model.train()                                             # training mode
-        for x, y in dl_syn:                                       # iterate synthetic batches once
-            opt.zero_grad()                                       # clear previous gradients
-            logits = model(x.to(DEVICE))                          # forward pass
-            loss = loss_fn(logits, y.to(DEVICE))                  # compute loss
-            loss.backward()                                       # backprop to compute gradients
-            opt.step()                                            # update the head’s weights
+        model.train()
+        for x, y in dl_syn:
+            opt.zero_grad()
+            logits = model(x.to(DEVICE))
+            loss = loss_fn(logits, y.to(DEVICE))
+            loss.backward()
+            opt.step()
 
-    # 6) Measure accuracy on real photos *before* fine-tuning (baseline).
+    # 6) Baseline accuracy on real photos *before* tuning.
     pre_acc = accuracy(model, dl_eval)
 
-    # 7) Fine-tune on the 20 real photos for a few epochs with logging.
-    rows = [["epoch", "train_acc", "val_acc", "sec", "peak_MB", "ext4_ms", "tmpfs_ms"]] # CSV header
-    for epoch in range(1, args.epochs_real + 1):              # e.g., 1..3
-        t0 = time.time()                                      # start epoch timer
-        model.train()                                         # set train mode
-        for x, y in dl_real:                                  # iterate real data
-            opt.zero_grad()                                   # reset gradients
-            logits = model(x.to(DEVICE))                      # forward
-            loss = loss_fn(logits, y.to(DEVICE))              # compute loss
-            loss.backward()                                   # backward pass
-            opt.step()                                        # update classifier weights
-        sec = time.time() - t0                                # seconds for this epoch
+    # Save baseline ru_maxrss so we can also report delta-peak during training.
+    baseline_ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
-        peakMB = peak_delta_mb()                              # measure RAM usage now
-        tr_acc = accuracy(model, dl_eval)                     # accuracy on (tiny) training set
-        va_acc = tr_acc                                       # no separate val set → reuse as proxy
+    # 7) Fine-tune loop with logging.
+    # CSV columns include both now-RSS, absolute PEAK, and delta-PEAK for reporting.
+    rows = [["epoch", "train_acc", "val_acc", "sec",
+             "now_MB", "peak_MB", "delta_MB", "ext4_ms", "tmpfs_ms"]]
 
-        ext4_ms, tmpfs_ms = timed_checkpoint(model,           # time disk vs RAM checkpoint
-                                             PROJECT / "model_final")
+    for epoch in range(1, args.epochs_real + 1):
+        # --- train one epoch ---
+        t0 = time.time()
+        model.train()
+        for x, y in dl_real:
+            opt.zero_grad()
+            logits = model(x.to(DEVICE))
+            loss = loss_fn(logits, y.to(DEVICE))
+            loss.backward()
+            opt.step()
+        sec = time.time() - t0
 
-        # Print a one-line log for this epoch (easy to read in terminal).
-        print(f"epoch {epoch}: acc={tr_acc:.2f} time={sec:.2f}s "
-              f"peak={peakMB}MB ext4={ext4_ms:.1f}ms tmpfs={tmpfs_ms:.1f}ms")
+        # --- memory + accuracy + checkpoint timings ---
+        nowMB    = rss_now_mb()                 # point-in-time RSS (MB)
+        peakMB   = abs_peak_mb()                # absolute process peak so far (MB)
+        deltaMB  = delta_peak_mb(baseline_ru)   # extra peak above baseline (MB)
 
-        # Append a row to write later into results.csv.
+        tr_acc = accuracy(model, dl_eval)       # on tiny training set, acts like proxy-val
+        va_acc = tr_acc
+
+        ext4_ms, tmpfs_ms = timed_checkpoint(model, PROJECT / "model_final")
+
+        # --- log to console & CSV ---
+        print(f"epoch {epoch}: acc={tr_acc:.2f}  time={sec:.2f}s  "
+              f"now={nowMB:.1f}MB  peak={peakMB:.1f}MB  delta={deltaMB:.1f}MB  "
+              f"ext4={ext4_ms:.1f}ms  tmpfs={tmpfs_ms:.1f}ms")
+
         rows.append([epoch, f"{tr_acc:.4f}", f"{va_acc:.4f}",
-                     f"{sec:.3f}", peakMB, f"{ext4_ms:.2f}", f"{tmpfs_ms:.2f}"])
+                     f"{sec:.3f}", f"{nowMB:.1f}", f"{peakMB:.1f}", f"{deltaMB:.1f}",
+                     f"{ext4_ms:.2f}", f"{tmpfs_ms:.2f}"])
 
-    # 8) Save the CSV so results are reproducible and easy to plot later.
+    # 8) Write results.csv
     with open(PROJECT / "results.csv", "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
-    # 9) Make two simple plots: accuracy vs epoch and peak RAM vs epoch.
+    # 9) Make two simple plots: accuracy vs epoch and PEAK RSS vs epoch.
     try:
-        import pandas as pd                                  # only used for plotting convenience
-        import matplotlib.pyplot as plt                      # plotting library
+        import pandas as pd
+        import matplotlib.pyplot as plt
 
-        df = pd.read_csv(PROJECT / "results.csv")           # read the CSV we just wrote
+        df = pd.read_csv(PROJECT / "results.csv")
 
         plt.figure()
-        plt.plot(df["epoch"], df["train_acc"], marker="o")  # accuracy curve
+        plt.plot(df["epoch"], df["train_acc"], marker="o")
         plt.xlabel("epoch")
         plt.ylabel("accuracy")
         plt.title("Accuracy vs epoch")
@@ -293,30 +304,32 @@ def main():
         plt.savefig(PLOTS / "accuracy_vs_epoch.png", dpi=160)
 
         plt.figure()
-        plt.plot(df["epoch"], df["peak_MB"], marker="o")    # memory curve
+        # Plot the *absolute* peak RSS to align with success criterion
+        plt.plot(df["epoch"], df["peak_MB"], marker="o")
         plt.xlabel("epoch")
         plt.ylabel("peak RSS (MB)")
         plt.title("Peak RSS vs epoch")
         plt.savefig(PLOTS / "mem_vs_epoch.png", dpi=160)
 
-        print("Wrote plots to", PLOTS)                      # confirm where images went
+        print("Wrote plots to", PLOTS)
     except Exception as e:
-        # If matplotlib/pandas aren’t installed, skip plotting but keep CSV.
         print("Plotting skipped:", e)
 
-    # 10) Summarize against success criteria (time + memory thresholds).
-    final_acc = float(rows[-1][1])                           # last epoch’s accuracy
-    total_time = sum(float(r[3]) for r in rows[1:])          # sum of per-epoch seconds
-    ok_time = total_time < 60.0                              # target: < 60 seconds total
-    ok_mem  = max(int(r[4]) for r in rows[1:]) < 400         # target: < 400 MB peak
+    # 10) Summarize vs success criteria.
+    final_acc  = float(rows[-1][1])   # last epoch’s accuracy (string in CSV row)
+    total_time = sum(float(r[3]) for r in rows[1:])
+    # Use the absolute *peak_MB* column for the memory criterion
+    peak_overall = max(float(r[5]) for r in rows[1:])
 
-    # Print a short, decision-oriented summary for your report.
+    ok_time = total_time < 60.0
+    ok_mem  = peak_overall < 400.0
+
     print(f"\nPre-tune acc on real: {pre_acc:.2f}")
     print(f"Final acc on real:    {final_acc:.2f}")
     print(f"Total fine-tune time: {total_time:.1f}s  (target < 60s)  -> {'OK' if ok_time else 'OVER'}")
-    print(f"Peak RSS during tune: {max(int(r[4]) for r in rows[1:])}MB (target < 400MB) -> {'OK' if ok_mem else 'OVER'}")
+    print(f"Peak RSS during tune: {peak_overall:.0f}MB (target < 400MB) -> {'OK' if ok_mem else 'OVER'}")
     print("Check results.csv and plots/ for details.")
 
-# Standard Python entry point so the script only runs when executed directly.
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
     main()

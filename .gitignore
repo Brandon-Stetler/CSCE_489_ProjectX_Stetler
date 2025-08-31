@@ -53,9 +53,7 @@ htmlcov/              # coverage HTML report
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROJECT-SPECIFIC: DATA, OUTPUTS, AND ARTIFACTS
-# Real photos: privacy-sensitive & large; keep the folder, ignore its contents.
-data_real/**
-!data_real/.gitkeep   # allow an empty placeholder so the dir exists in repo
+
 
 # Synthetic images: fully regenerable; don't store bulky generated data.
 data_synth/**

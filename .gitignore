@@ -1,17 +1,79 @@
-# python
-.venv/
-__pycache__/
-*.pyc
-# outputs
-plots/
-runs/
-results.csv
-*.log
-*.pt
-*.tmp
-# data
-data_real/
-data_synth/
-# OS/editor
+# ─────────────────────────────────────────────────────────────────────────────
+# OS / DESKTOP JUNK FILES
+# These are created by Finder (macOS) and Explorer (Windows). Noise in diffs.
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Icon?                 # macOS icon preview files (pattern matches Icon\r)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYTHON BYTECODE & BUILD ARTIFACTS
+__pycache__/          # Python bytecode cache; varies by interpreter/OS
+*.py[cod]             # Compiled .pyc/.pyo/.pyd files
+*$py.class            # Jython/old patterns
+build/                # Packaging build output
+dist/                 # Packaging distribution files (wheel/sdist)
+*.egg-info/           # Package metadata directories
+*.egg                 # Old python eggs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIRTUAL ENVIRONMENTS (keep requirements.txt instead)
+.venv/
+venv/
+env/
+.python-version       # pyenv local version pin (developer-specific)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTEBOOK / TEST / TOOLING CACHES
+.ipynb_checkpoints/   # Jupyter autosaves
+.pytest_cache/        # pytest cache
+.mypy_cache/          # mypy type checker cache
+.ruff_cache/          # ruff linter cache
+.coverage*            # coverage.py data files
+htmlcov/              # coverage HTML report
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDITOR / IDE SETTINGS (developer-specific, not project state)
+.vscode/
+*.code-workspace
+.idea/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGS / TEMPORARY / BACKUP FILES
+*.log
+*.tmp
+*.bak
+*~
+.~*
+*.lock                # Generic lockfiles (pip/poetry/etc.)
+
+# MS Office lock files (appear while a doc is open)
+~$*.docx
+~$*.pptx
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROJECT-SPECIFIC: DATA, OUTPUTS, AND ARTIFACTS
+# Real photos: privacy-sensitive & large; keep the folder, ignore its contents.
+data_real/**
+!data_real/.gitkeep   # allow an empty placeholder so the dir exists in repo
+
+# Synthetic images: fully regenerable; don't store bulky generated data.
+data_synth/**
+!data_synth/.gitkeep  # keep the empty dir tracked
+
+# Plots: generated outputs; treat as build artifacts (your script regenerates).
+plots/**
+!plots/.gitkeep       # keep the empty dir tracked
+
+# CSV results are derived; keep reproducibility by regenerating from code.
+results.csv
+
+# Model checkpoints: large binaries; easy to bloat repo & pollute diffs.
+model_*.pt
+*.pt
+*.pt.tmp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT VARIABLES / SECRETS (if you add them later)
+.env
+.env.*
